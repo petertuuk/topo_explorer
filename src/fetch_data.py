@@ -1,13 +1,10 @@
-"""Fetch elevation rasters from OpenTopography's Global Datasets API.
+"""Fetch elevation rasters from USGS 3DEP (US) or OpenTopography (Global).
 
-Handles three things the raw API doesn't do for you:
-  1. Area limits: each dataset caps how much area you can request in one
-     call, so large bounding boxes are automatically split into a grid of
-     sub-requests.
-  2. Mosaicking: multiple tiles are merged back into a single GeoTIFF with
-     rasterio.merge.
-  3. Caching: results are cached on disk keyed by (demtype, bbox), so
-     re-requesting the same area is instant and doesn't burn API calls.
+Handles four main workflows:
+  1. USGS 3DEP (US Coverage): Free, high-resolution (10m / 30m), no API key, no rate limits.
+  2. Area limits & Tiling: Automatically splits large bounding box requests.
+  3. Mosaicking & Caching: Merges multi-tile responses into cached GeoTIFFs.
+  4. Local Basemaps: Fast windowed reads from local NOAA ETOPO files.
 """
 
 from __future__ import annotations
@@ -20,27 +17,25 @@ from pathlib import Path
 import requests
 
 OPENTOPO_URL = "https://portal.opentopography.org/API/globaldem"
+USGS_3DEP_WCS_URL = "https://elevation.nationalmap.gov/arcgis/services/3DEPElevation/ImageServer/WCSServer"
 
-# Public demo key: shared by everyone, capped at ~25 total requests. Fine for
-# a first look; get your own free key from https://portal.opentopography.org
-# and set OPENTOPOGRAPHY_API_KEY for real use.
 DEMO_API_KEY = "demoapikeyot2022"
 
-# Conservative per-request area caps (km^2), a bit under OpenTopography's
-# documented limits so a request never gets rejected right at the edge.
 AREA_LIMIT_KM2 = {
-    "SRTMGL1": 400_000,      # ~30 m, documented cap 450,000
+    "USGS_13": 50_000,       # ~10 m USGS 3DEP (1/3 arc-sec)
+    "USGS_1": 200_000,       # ~30 m USGS 3DEP (1 arc-sec)
+    "SRTMGL1": 400_000,      # ~30 m
     "AW3D30": 400_000,       # ~30 m
     "COP30": 400_000,        # ~30 m
     "NASADEM": 400_000,      # ~30 m
-    "SRTMGL3": 3_800_000,    # ~90 m, documented cap 4,050,000
+    "SRTMGL3": 3_800_000,    # ~90 m
     "COP90": 3_800_000,      # ~90 m
-    "SRTM15Plus": 100_000_000,  # ~450 m, documented cap 125,000,000
+    "SRTM15Plus": 100_000_000,  # ~450 m
 }
 
-# Roughly meters-per-pixel for each dataset, used to auto-pick a resolution
-# based on how large an area is being requested.
 RESOLUTION_M = {
+    "USGS_13": 10,
+    "USGS_1": 30,
     "SRTMGL1": 30,
     "AW3D30": 30,
     "COP30": 30,
@@ -52,12 +47,6 @@ RESOLUTION_M = {
 
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent.parent / "data"
 
-# --------------------------------------------------------------------------
-# Bulk basemap: NOAA ETOPO 2022 global relief model. Single static files,
-# no API key, no rate limit - download once, then every area is just a
-# local rasterio window-read. Use this as your everyday data source; save
-# the rate-limited OpenTopography API below for occasional high-res zooms.
-# --------------------------------------------------------------------------
 BASEMAP_SOURCES = {
     "etopo60s": {
         "url": (
@@ -79,8 +68,7 @@ BASEMAP_SOURCES = {
 
 
 def bbox_area_km2(bbox: tuple[float, float, float, float]) -> float:
-    """Rough area of a lon/lat bbox in km^2 (equirectangular approximation,
-    accurate enough for deciding how to tile a request)."""
+    """Rough area of a lon/lat bbox in km^2."""
     west, south, east, north = bbox
     lat_mid = math.radians((south + north) / 2)
     km_per_deg_lat = 111.32
@@ -90,13 +78,31 @@ def bbox_area_km2(bbox: tuple[float, float, float, float]) -> float:
     return abs(width_km * height_km)
 
 
+def is_in_us(bbox: tuple[float, float, float, float]) -> bool:
+    """Check if bbox roughly falls inside the US (CONUS, Alaska, Hawaii)."""
+    west, south, east, north = bbox
+    conus = (-125.0 <= west and east <= -66.5 and 24.5 <= south and north <= 49.5)
+    alaska = (-180.0 <= west and east <= -129.0 and 51.0 <= south and north <= 71.5)
+    hawaii = (-160.5 <= west and east <= -154.5 and 18.5 <= south and north <= 22.5)
+    return conus or alaska or hawaii
+
+
 def pick_demtype(bbox: tuple[float, float, float, float], prefer_high_res: bool = True) -> str:
-    """Choose the finest dataset whose area cap comfortably covers this bbox."""
+    """Choose dataset based on geographic area and resolution preference."""
     area = bbox_area_km2(bbox)
+    
+    # Prefer USGS 3DEP if inside US coordinates
+    if is_in_us(bbox):
+        if prefer_high_res and area <= AREA_LIMIT_KM2["USGS_13"]:
+            return "USGS_13"
+        elif area <= AREA_LIMIT_KM2["USGS_1"]:
+            return "USGS_1"
+
     if prefer_high_res:
         ordered = ["SRTMGL1", "SRTMGL3", "SRTM15Plus"]
     else:
         ordered = ["SRTMGL3", "SRTM15Plus"]
+
     for demtype in ordered:
         if area <= AREA_LIMIT_KM2[demtype]:
             return demtype
@@ -106,7 +112,7 @@ def pick_demtype(bbox: tuple[float, float, float, float], prefer_high_res: bool 
 def split_bbox(
     bbox: tuple[float, float, float, float], max_area_km2: float
 ) -> list[tuple[float, float, float, float]]:
-    """Split a bbox into a grid of sub-bboxes that each fit under max_area_km2."""
+    """Split a bbox into a grid fitting max_area_km2."""
     area = bbox_area_km2(bbox)
     if area <= max_area_km2:
         return [bbox]
@@ -136,13 +142,77 @@ def _cache_key(demtype: str, bbox: tuple[float, float, float, float]) -> str:
     return f"{demtype}_{digest}"
 
 
-def _download_tile(
+import json
+
+import json
+import requests
+from pathlib import Path
+
+def _download_usgs_3dep_tile(
+    bbox: tuple[float, float, float, float],
+    demtype: str,
+    out_path: Path,
+    timeout: int = 120,
+) -> Path:
+    """Download USGS 3DEP elevation data via ArcGIS REST API."""
+    west, south, east, north = bbox
+    
+    # 1/3 arc-sec (~10m) vs 1 arc-sec (~30m)
+    res_deg = 0.00009259259 if demtype == "USGS_13" else 0.00027777777
+    
+    # Calculate pixel dimensions with a conservative cap (2048px) to avoid 500 buffer memory limits
+    width = max(1, int(round(abs(east - west) / res_deg)))
+    height = max(1, int(round(abs(north - south) / res_deg)))
+
+    max_dim = 2048
+    if width > max_dim or height > max_dim:
+        scale = max_dim / max(width, height)
+        width = max(1, int(width * scale))
+        height = max(1, int(height * scale))
+
+    # USGS 3DEP ImageServer export endpoint
+    url = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
+    
+    # Rounded bounding box coordinates prevent internal geometry precision errors
+    bbox_str = f"{west:.6f},{south:.6f},{east:.6f},{north:.6f}"
+
+    params = {
+        "bbox": bbox_str,
+        "bboxSR": "4326",
+        "imageSR": "4326",
+        "size": f"{width},{height}",
+        "format": "tiff",  # GeoTIFF output
+        "pixelType": "F32",
+        "noData": "-9999",
+        "f": "image",
+    }
+
+    response = requests.get(url, params=params, timeout=timeout)
+    
+    if response.status_code != 200:
+        raise RuntimeError(f"USGS 3DEP HTTP error ({response.status_code}): {response.text[:500]}")
+
+    # TIFF headers start with 'II' (little-endian) or 'MM' (big-endian)
+    if not response.content.startswith((b"II\x2a\x00", b"MM\x00\x2a")):
+        try:
+            err_json = response.json()
+            err_msg = err_json.get("error", {}).get("message", response.text[:500])
+        except Exception:
+            err_msg = response.text[:500]
+        raise RuntimeError(f"USGS 3DEP API returned non-TIFF response: {err_msg}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(response.content)
+    return out_path
+
+def _download_opentopo_tile(
     bbox: tuple[float, float, float, float],
     demtype: str,
     api_key: str,
     out_path: Path,
     timeout: int = 120,
 ) -> Path:
+    """Download OpenTopography tile."""
     west, south, east, north = bbox
     params = {
         "demtype": demtype,
@@ -172,26 +242,7 @@ def fetch_dem(
     force: bool = False,
     progress_callback=None,
 ) -> Path:
-    """Fetch a (possibly mosaicked) elevation GeoTIFF covering bbox.
-
-    Parameters
-    ----------
-    bbox: (west, south, east, north) in decimal degrees.
-    demtype: one of the OpenTopography dataset codes (SRTMGL1, SRTMGL3,
-        SRTM15Plus, COP30, COP90, AW3D30, NASADEM). If None, a sensible
-        resolution is picked automatically based on the bbox size.
-    api_key: OpenTopography API key. Falls back to the
-        OPENTOPOGRAPHY_API_KEY environment variable, then to the shared
-        rate-limited demo key.
-    cache_dir: where to store downloaded/merged GeoTIFFs.
-    force: re-download even if a cached merged file already exists.
-    progress_callback: optional callable(str) invoked with status messages,
-        useful for updating a GUI while a multi-tile fetch is in progress.
-
-    Returns
-    -------
-    Path to a single merged GeoTIFF covering bbox.
-    """
+    """Fetch elevation GeoTIFF covering bbox (USGS 3DEP or OpenTopography)."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,8 +270,12 @@ def fetch_dem(
         if tile_path.exists() and not force:
             _report(f"[{idx}/{len(tiles)}] using cached tile")
         else:
-            _report(f"[{idx}/{len(tiles)}] downloading {demtype} tile from OpenTopography...")
-            _download_tile(tile_bbox, demtype, api_key, tile_path)
+            if demtype in ("USGS_13", "USGS_1"):
+                _report(f"[{idx}/{len(tiles)}] downloading {demtype} from USGS 3DEP...")
+                _download_usgs_3dep_tile(tile_bbox, demtype, tile_path)
+            else:
+                _report(f"[{idx}/{len(tiles)}] downloading {demtype} tile from OpenTopography...")
+                _download_opentopo_tile(tile_bbox, demtype, api_key, tile_path)
         tile_paths.append(tile_path)
 
     if len(tile_paths) == 1:
@@ -255,10 +310,7 @@ def _merge_tiles(tile_paths: list[Path], out_path: Path) -> None:
 
 
 def load_elevation(path: str | Path):
-    """Load a GeoTIFF into a (data, extent) pair for imshow.
-
-    extent is (west, east, south, north), matching matplotlib's convention.
-    """
+    """Load a GeoTIFF into a (data, extent) pair for plotting."""
     import numpy as np
     import rasterio
 
@@ -286,15 +338,6 @@ def download_basemap(
     force: bool = False,
     progress_callback=None,
 ) -> Path:
-    """Download one of the static, unauthenticated, non-rate-limited global
-    ETOPO 2022 GeoTIFFs (see BASEMAP_SOURCES). One-time cost of a few hundred
-    MB to a couple GB; every subsequent area lookup is a local windowed read
-    via read_basemap_window, with no further network calls.
-
-    progress_callback, if given, is called as progress_callback(fraction)
-    with fraction in [0, 1] (or None once total size is unknown) as bytes
-    stream in.
-    """
     if source not in BASEMAP_SOURCES:
         raise KeyError(f"Unknown basemap source '{source}'. Options: {list(BASEMAP_SOURCES)}")
 
@@ -334,12 +377,6 @@ def read_basemap_window(
     source: str = "etopo60s",
     cache_dir: str | Path = DEFAULT_CACHE_DIR,
 ):
-    """Read just the portion of the downloaded basemap covering bbox.
-
-    No network access - the basemap must already be downloaded via
-    download_basemap(). Returns the same (data, extent) shape as
-    load_elevation().
-    """
     import numpy as np
     import rasterio
     from rasterio.windows import from_bounds
@@ -358,5 +395,6 @@ def read_basemap_window(
         if nodata is not None:
             data = np.where(data == nodata, np.nan, data)
         win_bounds = rasterio.windows.bounds(window, src.transform)
-    extent = (win_bounds[0], win_bounds[2], win_bounds[1], win_bounds[3])  # west, east, south, north
+    # data = np.clip(data, a_min=0, a_max=None)
+    extent = (win_bounds[0], win_bounds[2], win_bounds[1], win_bounds[3])
     return data, extent

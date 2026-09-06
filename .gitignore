@@ -1,0 +1,5 @@
+.DS_Store
+OT_API_KEY
+data
+cache
+src/__pycache__
