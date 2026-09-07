@@ -88,16 +88,19 @@ def is_in_us(bbox: tuple[float, float, float, float]) -> bool:
 
 
 def pick_demtype(bbox: tuple[float, float, float, float], prefer_high_res: bool = True) -> str:
-    """Choose dataset based on geographic area and resolution preference."""
-    area = bbox_area_km2(bbox)
-    
-    # Prefer USGS 3DEP if inside US coordinates
-    if is_in_us(bbox):
-        if prefer_high_res and area <= AREA_LIMIT_KM2["USGS_13"]:
-            return "USGS_13"
-        elif area <= AREA_LIMIT_KM2["USGS_1"]:
-            return "USGS_1"
+    """Choose dataset based on geographic location and resolution preference.
 
+    For US-covering bboxes, always prefer USGS 3DEP regardless of area.
+    fetch_dem's tiling (split_bbox) already splits large requests into
+    multiple tiles automatically, and in practice the USGS tile servers
+    have proven faster overall than a single large request to a global
+    provider like OpenTopography/SRTM — so there's no reason to fall back
+    to a global, lower-resolution dataset just because the area is large.
+    """
+    if is_in_us(bbox):
+        return "USGS_13" if prefer_high_res else "USGS_1"
+
+    area = bbox_area_km2(bbox)
     if prefer_high_res:
         ordered = ["SRTMGL1", "SRTMGL3", "SRTM15Plus"]
     else:
