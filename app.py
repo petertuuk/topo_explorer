@@ -102,6 +102,10 @@ CITIES_URL = (
     "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/"
     "geojson/ne_10m_populated_places_simple.geojson"
 )
+HIGHWAYS_URL = (
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/"
+    "geojson/ne_10m_roads.geojson"
+)
 
 def downsample_for_display(data: np.ndarray, max_dim: int = MAX_DISPLAY_DIM) -> np.ndarray:
     rows, cols = data.shape
@@ -297,6 +301,54 @@ def _add_city_markers(fig, bbox, top_n=10):
         )
 
 
+@st.cache_data(show_spinner=False)
+def _load_highways():
+    roads = gpd.read_file(HIGHWAYS_URL).to_crs("EPSG:4326")
+
+    # Natural Earth's roads layer covers every road class worldwide; filter
+    # down to major highways only so this stays a lightweight reference
+    # layer rather than a full road network. Schema naming has varied across
+    # Natural Earth releases, so check a few likely column/value spellings
+    # and fall back to the unfiltered set (still simplified) if none match.
+    type_col = next(
+        (c for c in ("type", "TYPE", "featurecla", "FEATURECLA") if c in roads.columns),
+        None,
+    )
+    if type_col is not None:
+        major_mask = roads[type_col].astype(str).str.contains(
+            "Major Highway|Motorway|Beltway", case=False, na=False
+        )
+        if major_mask.any():
+            roads = roads[major_mask]
+
+    roads = roads.copy()
+    roads["geometry"] = roads.geometry.simplify(
+        BOUNDARY_SIMPLIFY_TOLERANCE, preserve_topology=False
+    )
+    return roads
+
+
+def _add_highways(fig, bbox):
+    all_x, all_y = _session_cache(
+        "highways_trace_cache",
+        st.session_state.get("bbox_key"),
+        lambda: _boundary_xy_traces(_load_highways(), bbox),
+    )
+
+    if all_x:
+        fig.add_trace(
+            go.Scatter(
+                x=all_x,
+                y=all_y,
+                mode="lines",
+                line=dict(color="#ff6600", width=1.25),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+
+
 @lru_cache(maxsize=None)
 def matplotlib_to_plotly_colorscale(cmap_name: str, n_samples: int = 256) -> tuple:
     """Converts a Matplotlib colormap into a Plotly-compatible colorscale.
@@ -469,6 +521,7 @@ state_lines_on = st.sidebar.checkbox("State boundaries", value=True)
 county_lines_on = st.sidebar.checkbox("County boundaries", value=False)
 lake_lines_on = st.sidebar.checkbox("Lakes & inland water", value=False)
 cities_on = st.sidebar.checkbox("Nearby cities (top 10 by population)", value=True)
+highways_on = st.sidebar.checkbox("Major highways", value=False)
 colormap_choice = st.sidebar.selectbox("Colormap", list(COLORSCALES))
 
 # --------------------------------------------------------------------------
@@ -738,6 +791,13 @@ with _timed("city markers"):
             _add_city_markers(fig, (west, south, east, north), top_n=10)
         except Exception as exc:  # noqa: BLE001
             st.sidebar.warning(f"Could not load city markers: {exc}")
+
+with _timed("highways"):
+    if highways_on:
+        try:
+            _add_highways(fig, (west, south, east, north))
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.warning(f"Could not load highways: {exc}")
 
 with _timed("contour lines"):
     if contour_on:
