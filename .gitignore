@@ -3,3 +3,4 @@ OT_API_KEY
 data
 cache
 src/__pycache__
+.venv
