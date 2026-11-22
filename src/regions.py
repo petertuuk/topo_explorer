@@ -1,7 +1,7 @@
 """Named bounding boxes for quick navigation.
 
 Every bbox is (west, south, east, north) in decimal-degree longitude/latitude
-(EPSG:4326), matching the order OpenTopography's API expects.
+(EPSG:4326).
 """
 
 from __future__ import annotations
@@ -9,21 +9,6 @@ from __future__ import annotations
 # Whole contiguous US (CONUS). Alaska/Hawaii are left out to keep the default
 # view a single contiguous, reasonably-proportioned raster.
 CONUS = (-125.0, 24.5, -66.9, 49.5)
-
-REGIONS: dict[str, tuple[float, float, float, float]] = {
-    "conus": CONUS,
-    "rockies": (-111.0, 36.0, -104.5, 45.0),
-    "sierra_nevada": (-120.5, 35.5, -117.5, 39.5),
-    "cascades": (-123.0, 42.5, -120.5, 49.0),
-    "appalachians": (-84.5, 34.0, -76.5, 42.5),
-    "grand_canyon": (-114.3, 35.7, -111.4, 37.1),
-    "great_plains": (-104.0, 35.0, -96.0, 45.0),
-    "adirondacks": (-75.2, 43.6, -73.5, 44.9),
-    "black_hills": (-104.3, 43.4, -103.0, 44.6),
-    "olympic_peninsula": (-124.8, 47.3, -122.9, 48.4),
-    "smoky_mountains": (-84.0, 35.3, -82.7, 36.0),
-}
-
 
 REGIONS: dict[str, tuple[float, float, float, float]] = {
     "conus": CONUS,

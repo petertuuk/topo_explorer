@@ -6,6 +6,8 @@ Run with:
 
 from __future__ import annotations
 
+import base64
+import io
 import os
 import time
 from contextlib import contextmanager
@@ -15,8 +17,11 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
+import shapely
 import streamlit as st
-from matplotlib.colors import LightSource, Normalize
+import contourpy
+from matplotlib.colors import LightSource
+from PIL import Image
 from scipy.ndimage import gaussian_filter
 from shapely.geometry import box
 
@@ -107,6 +112,29 @@ HIGHWAYS_URL = (
     "geojson/ne_10m_roads.geojson"
 )
 
+VECTOR_CACHE_DIR = fetch_data.DEFAULT_CACHE_DIR / "vector"
+
+
+def _read_vector_cached(cache_name: str, build):
+    """Return a processed GeoDataFrame, building it (download + simplify +
+    filter) only the first time and keeping the result in data/vector/ as
+    GeoParquet. Without this, every Streamlit restart re-downloaded every
+    layer (the roads file alone is tens of MB)."""
+    path = VECTOR_CACHE_DIR / f"{cache_name}.parquet"
+    if path.exists():
+        try:
+            return gpd.read_parquet(path)
+        except Exception:  # noqa: BLE001 - corrupt/old cache: rebuild below
+            pass
+    gdf = build()
+    try:
+        VECTOR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        gdf.to_parquet(path)
+    except Exception:  # noqa: BLE001 - e.g. pyarrow missing; caching is optional
+        pass
+    return gdf
+
+
 def downsample_for_display(data: np.ndarray, max_dim: int = MAX_DISPLAY_DIM) -> np.ndarray:
     rows, cols = data.shape
     step = max(1, -(-max(rows, cols) // max_dim))  # ceil division
@@ -118,41 +146,66 @@ def downsample_for_display(data: np.ndarray, max_dim: int = MAX_DISPLAY_DIM) -> 
     return smoothed[::step, ::step]
 
 
-@st.cache_data(show_spinner=False)
-def _load_state_boundaries():
+def _build_state_boundaries():
     states = gpd.read_file(STATE_BOUNDARIES_URL).to_crs("EPSG:4326")
     # Simplify once here rather than on every render — the geometry is
     # far more detailed than what's ever visible on screen.
     states["geometry"] = states.geometry.simplify(
         BOUNDARY_SIMPLIFY_TOLERANCE, preserve_topology=False
     )
-    return states
+    return _to_lines(states[["geometry"]])
+
+
+@st.cache_resource(show_spinner=False)
+def _load_state_boundaries():
+    return _read_vector_cached("states", _build_state_boundaries)
+
+
+_EMPTY_XY = (np.empty(0), np.empty(0))
+
+
+def _to_lines(gdf):
+    """Convert polygon layers to their outlines (lines) once, at load time.
+
+    Clipping outlines rather than polygons means the bbox edge never shows up
+    as a fake boundary segment, and every layer can share the same fast
+    line-extraction path below.
+    """
+    is_poly = gdf.geom_type.isin(["Polygon", "MultiPolygon"])
+    if is_poly.any():
+        gdf = gdf.copy()
+        gdf.loc[is_poly, "geometry"] = gdf.loc[is_poly].geometry.boundary
+    return gdf
+
+
+def _lines_to_xy(geometries):
+    """Flatten line geometries into one pair of x/y arrays with NaN gaps.
+
+    Plotly draws a NaN as a break in the line, so a whole layer becomes a
+    single trace. Returning numpy arrays (not Python lists with None) matters
+    a lot: Plotly serializes arrays as compact binary, while lists of floats
+    go through slow per-element JSON encoding on every rerun.
+    """
+    parts = shapely.get_parts(np.asarray(geometries, dtype=object))
+    parts = parts[np.isin(shapely.get_type_id(parts), (1, 2))]  # LineString/LinearRing
+    parts = parts[~shapely.is_empty(parts)]
+    if parts.size == 0:
+        return _EMPTY_XY
+    coords, index = shapely.get_coordinates(parts, return_index=True)
+    breaks = np.flatnonzero(np.diff(index)) + 1
+    # float32 halves the payload; its ~1 m precision is far below pixel size.
+    xy = np.insert(coords.astype(np.float32), breaks, np.nan, axis=0)
+    return xy[:, 0], xy[:, 1]
 
 
 def _boundary_xy_traces(gdf, bbox):
-    """Vectorized clip + coordinate extraction shared by all boundary layers."""
+    """Clip a line layer to bbox and return NaN-separated x/y arrays."""
     west, south, east, north = bbox
     subset = gdf.cx[west:east, south:north]
     if subset.empty:
-        return [], []
-
+        return _EMPTY_XY
     clipped = gpd.clip(subset, box(west, south, east, north))
-
-    all_x, all_y = [], []
-    for geometry in clipped.geometry:
-        if geometry is None or geometry.is_empty:
-            continue
-
-        parts = geometry.geoms if hasattr(geometry, "geoms") else [geometry]
-        for part in parts:
-            if part.is_empty:
-                continue
-            boundary = part.exterior if hasattr(part, "exterior") else part
-            x, y = boundary.xy
-            all_x.extend(list(x) + [None])
-            all_y.extend(list(y) + [None])
-
-    return all_x, all_y
+    return _lines_to_xy(clipped.geometry.values)
 
 
 def _add_state_boundaries(fig, bbox):
@@ -163,7 +216,7 @@ def _add_state_boundaries(fig, bbox):
     )
 
     # Batch all geometries into one trace for optimal rendering speed
-    if all_x:
+    if len(all_x):
         fig.add_trace(
             go.Scatter(
                 x=all_x,
@@ -176,14 +229,18 @@ def _add_state_boundaries(fig, bbox):
         )
 
 
-@st.cache_data(show_spinner=False)
-def _load_county_boundaries():
+def _build_county_boundaries():
     counties = gpd.read_file(COUNTY_BOUNDARIES_URL).to_crs("EPSG:4326")
     # This is the big one (~3,200 polygons) — simplification here matters most.
     counties["geometry"] = counties.geometry.simplify(
         BOUNDARY_SIMPLIFY_TOLERANCE, preserve_topology=False
     )
-    return counties
+    return _to_lines(counties[["geometry"]])
+
+
+@st.cache_resource(show_spinner=False)
+def _load_county_boundaries():
+    return _read_vector_cached("counties", _build_county_boundaries)
 
 
 def _add_county_boundaries(fig, bbox):
@@ -193,7 +250,7 @@ def _add_county_boundaries(fig, bbox):
         lambda: _boundary_xy_traces(_load_county_boundaries(), bbox),
     )
 
-    if all_x:
+    if len(all_x):
         fig.add_trace(
             go.Scatter(
                 x=all_x,
@@ -207,13 +264,17 @@ def _add_county_boundaries(fig, bbox):
         )
 
 
-@st.cache_data(show_spinner=False)
-def _load_lake_boundaries():
+def _build_lake_boundaries():
     lakes = gpd.read_file(LAKES_BOUNDARIES_URL).to_crs("EPSG:4326")
     lakes["geometry"] = lakes.geometry.simplify(
         BOUNDARY_SIMPLIFY_TOLERANCE, preserve_topology=False
     )
-    return lakes
+    return _to_lines(lakes[["geometry"]])
+
+
+@st.cache_resource(show_spinner=False)
+def _load_lake_boundaries():
+    return _read_vector_cached("lakes", _build_lake_boundaries)
 
 
 def _add_lake_boundaries(fig, bbox):
@@ -223,7 +284,7 @@ def _add_lake_boundaries(fig, bbox):
         lambda: _boundary_xy_traces(_load_lake_boundaries(), bbox),
     )
 
-    if all_x:
+    if len(all_x):
         fig.add_trace(
             go.Scatter(
                 x=all_x,
@@ -236,8 +297,12 @@ def _add_lake_boundaries(fig, bbox):
         )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_cities():
+    return _read_vector_cached("cities", _build_cities)
+
+
+def _build_cities():
     cities = gpd.read_file(CITIES_URL).to_crs("EPSG:4326")
     # Natural Earth's "simple" populated-places layer uses pop_max for the
     # largest reasonable population estimate per place; fall back gracefully
@@ -301,8 +366,12 @@ def _add_city_markers(fig, bbox, top_n=10):
         )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_highways():
+    return _read_vector_cached("highways", _build_highways)
+
+
+def _build_highways():
     roads = gpd.read_file(HIGHWAYS_URL).to_crs("EPSG:4326")
 
     # Natural Earth's roads layer covers every road class worldwide; filter
@@ -321,7 +390,7 @@ def _load_highways():
         if major_mask.any():
             roads = roads[major_mask]
 
-    roads = roads.copy()
+    roads = roads[["geometry"]].copy()
     roads["geometry"] = roads.geometry.simplify(
         BOUNDARY_SIMPLIFY_TOLERANCE, preserve_topology=False
     )
@@ -335,7 +404,7 @@ def _add_highways(fig, bbox):
         lambda: _boundary_xy_traces(_load_highways(), bbox),
     )
 
-    if all_x:
+    if len(all_x):
         fig.add_trace(
             go.Scatter(
                 x=all_x,
@@ -416,12 +485,20 @@ if use_custom_bbox:
         st.session_state["bbox_east"] = float(default_bbox[2])
         st.session_state["bbox_north"] = float(default_bbox[3])
 
-    c1, c2 = st.sidebar.columns(2)
-    west = c1.number_input("West", format="%.3f", key="bbox_west")
-    south = c2.number_input("South", format="%.3f", key="bbox_south")
-    east = c1.number_input("East", format="%.3f", key="bbox_east")
-    north = c2.number_input("North", format="%.3f", key="bbox_north")
-    
+    # A form, so the area is only loaded when you click the button — not
+    # after every individual number you type (which, in online mode, meant
+    # a download for each half-edited bbox).
+    with st.sidebar.form("bbox_form", border=False):
+        c1, c2 = st.columns(2)
+        west = c1.number_input("West", format="%.3f", key="bbox_west")
+        south = c2.number_input("South", format="%.3f", key="bbox_south")
+        east = c1.number_input("East", format="%.3f", key="bbox_east")
+        north = c2.number_input("North", format="%.3f", key="bbox_north")
+        st.form_submit_button("Fetch this area", use_container_width=True)
+
+    if west >= east or south >= north:
+        st.sidebar.error("West must be less than East, and South less than North.")
+        st.stop()
     bbox = (west, south, east, north)
 else:
     bbox = regions.REGIONS[region_choice]
@@ -473,6 +550,16 @@ if source_mode == "Local basemap (offline)":
                 )
             st.rerun()
         st.stop()
+
+    if not fetch_data.basemap_has_overviews(basemap_source):
+        st.sidebar.info(
+            "One-time speed-up available: build overviews for this basemap so "
+            "zoomed-out areas load in milliseconds instead of ~1 s."
+        )
+        if st.sidebar.button("Build overviews", use_container_width=True):
+            with st.spinner("Building overviews (one time, ~1 minute)..."):
+                fetch_data.build_basemap_overviews(basemap_source)
+            st.rerun()
 else:
     demtype_choice = st.sidebar.selectbox("Resolution / dataset", list(DEMTYPE_LABELS))
     demtype = DEMTYPE_LABELS[demtype_choice]
@@ -485,35 +572,32 @@ else:
     # area, not just location — a bbox can be inside the US and still get
     # routed to a global dataset if it's too large for USGS 3DEP's limits.
     # --------------------------------------------------------------------
-    _resolved_demtype = demtype or fetch_data.pick_demtype(bbox)
-    _area_km2 = fetch_data.bbox_area_km2(bbox)
-    _resolution_m = fetch_data.RESOLUTION_M.get(_resolved_demtype)
-    _area_limit_km2 = fetch_data.AREA_LIMIT_KM2.get(_resolved_demtype, 400_000)
-    _tile_count = len(fetch_data.split_bbox(bbox, _area_limit_km2))
-    _is_usgs = _resolved_demtype in ("USGS_13", "USGS_1")
+    _plan = fetch_data.plan_request(bbox, demtype, target_px=MAX_DISPLAY_DIM)
+    _native_m = fetch_data.RESOLUTION_M.get(_plan.demtype)
 
-    with st.sidebar.expander("📋 What will be requested", expanded=True):
+    with st.sidebar.expander("📋 What will be requested", expanded=False):
         auto_note = (
             " (resolved by Auto)" if demtype_choice.startswith("Auto") else ""
         )
-        st.write(f"**Dataset:** {_resolved_demtype}{auto_note}")
+        st.write(f"**Dataset:** {_plan.demtype}{auto_note}")
         st.write(
-            f"**Source:** {'USGS 3DEP' if _is_usgs else 'OpenTopography'}  \n"
-            f"**Resolution:** ~{_resolution_m} m/px"
+            f"**Source:** {_plan.source}  \n"
+            f"**Resolution:** ~{_plan.res_m:,.0f} m/px (native ~{_native_m} m)  \n"
+            f"**Raster:** {_plan.width:,}×{_plan.height:,} px in "
+            f"{len(_plan.tiles)} request(s)"
         )
-        st.write(
-            f"**Area:** {_area_km2:,.0f} km²  \n"
-            f"**Single-tile limit for this dataset:** {_area_limit_km2:,.0f} km²"
-        )
-        if _tile_count > 1:
-            st.warning(
-                f"This area exceeds the single-tile limit, so it will be split into "
-                f"**{_tile_count} tiles**, downloaded one at a time and mosaicked "
-                f"together. Large tile counts can take a while — consider a lower "
-                f"resolution or a smaller area if this is too slow."
+        st.write(f"**Area:** {fetch_data.bbox_area_km2(bbox):,.0f} km²")
+        if _plan.source == "USGS 3DEP":
+            st.caption(
+                "USGS resamples server-side to the resolution that's displayed, "
+                "so zoom in (smaller box) for finer detail."
             )
-        else:
-            st.caption("Fits in a single tile request.")
+        elif len(_plan.tiles) > 1:
+            st.warning(
+                f"OpenTopography caps request area, so this will be split into "
+                f"**{len(_plan.tiles)} tiles** (downloaded in parallel). "
+                f"Consider a coarser dataset or smaller area if this is slow."
+            )
 
 st.sidebar.header("Display")
 hillshade_on = st.sidebar.checkbox("Hillshade", value=True)
@@ -529,14 +613,21 @@ colormap_choice = st.sidebar.selectbox("Colormap", list(COLORSCALES))
 # --------------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner=False, persist="disk")
+# In-memory only: the GeoTIFFs on disk already are the persistent cache, and
+# persist="disk" pickled every (often 100+ MB) array into an ever-growing
+# Streamlit cache folder.
+@st.cache_data(show_spinner=False, max_entries=8)
 def _read_basemap_window(bbox, basemap_source):
-    return fetch_data.read_basemap_window(bbox, source=basemap_source)
+    return fetch_data.read_basemap_window(
+        bbox, source=basemap_source, max_dim=MAX_DISPLAY_DIM
+    )
 
 
-@st.cache_data(show_spinner=False, persist="disk")
+@st.cache_data(show_spinner=False, max_entries=8)
 def _fetch_and_load(bbox, demtype, api_key):
-    path = fetch_data.fetch_dem(bbox, demtype=demtype, api_key=api_key or None)
+    path = fetch_data.fetch_dem(
+        bbox, demtype=demtype, api_key=api_key or None, target_px=MAX_DISPLAY_DIM
+    )
     return fetch_data.load_elevation(path)
 
 
@@ -571,9 +662,9 @@ if need_load:
     st.session_state["extent"] = extent
     st.session_state["bbox_key"] = state_key
     st.session_state["last_bbox"] = bbox
-    finite = data[np.isfinite(data)]
-    st.session_state["elev_min"] = float(np.nanmin(finite)) if finite.size else 0.0
-    st.session_state["elev_max"] = float(np.nanmax(finite)) if finite.size else 1.0
+    has_data = np.isfinite(data).any()
+    st.session_state["elev_min"] = float(np.nanmin(data)) if has_data else 0.0
+    st.session_state["elev_max"] = float(np.nanmax(data)) if has_data else 1.0
 
 data = st.session_state["data"]
 extent = st.session_state["extent"]
@@ -614,8 +705,6 @@ contour_interval = st.sidebar.slider(
     step=10,
 )
 
-import contourpy
-
 
 def _compute_contour_trace(display_data, bbox, interval=100):
     """Pure computation of contour line vertices — no fig, no Streamlit —
@@ -626,14 +715,14 @@ def _compute_contour_trace(display_data, bbox, interval=100):
     # 1. Mask missing or non-finite values
     valid_data = display_data[np.isfinite(display_data)]
     if valid_data.size == 0:
-        return [], []
+        return _EMPTY_XY
 
     min_elev = np.floor(valid_data.min() / interval) * interval
     max_elev = np.ceil(valid_data.max() / interval) * interval
     levels = np.arange(min_elev, max_elev + interval, interval)
 
     if len(levels) == 0:
-        return [], []
+        return _EMPTY_XY
 
     # 2. Build coordinate grids for contour calculation
     rows, cols = display_data.shape
@@ -645,23 +734,28 @@ def _compute_contour_trace(display_data, bbox, interval=100):
     # "Separate" line_type hands back one plain (N, 2) array per line segment,
     # so there's no path-code parsing (MOVETO/CLOSEPOLY) required either.
     # contourpy masks NaN/inf in z automatically, same as ax.contour did.
+    # "ChunkCombinedNan" hands back each level's lines already joined into a
+    # single array with NaN rows between them — exactly the shape Plotly
+    # wants for one trace — so there's no per-line Python work at all.
     gen = contourpy.contour_generator(
-        x=x_coords, y=y_coords, z=display_data, line_type="Separate"
+        x=x_coords, y=y_coords, z=display_data, line_type="ChunkCombinedNan"
     )
 
-    all_x, all_y = [], []
+    gap = np.array([[np.nan, np.nan]])
+    pieces = []
     for level in levels:
-        for line in gen.lines(level):
-            all_x.extend(line[:, 0].tolist())
-            all_x.append(None)
-            all_y.extend(line[:, 1].tolist())
-            all_y.append(None)
-
-    return all_x, all_y
+        for chunk in gen.lines(level)[0]:
+            if chunk is not None and len(chunk):
+                pieces.append(chunk)
+                pieces.append(gap)  # keep the next level from joining onto this one
+    if not pieces:
+        return _EMPTY_XY
+    xy = np.concatenate(pieces).astype(np.float32)
+    return xy[:, 0], xy[:, 1]
 
 
 def _add_contour_lines(fig, all_x, all_y):
-    if all_x:
+    if len(all_x):
         fig.add_trace(
             go.Scatter(
                 x=all_x,
@@ -687,8 +781,7 @@ display_data = _session_cache(
 )
 if display_data.shape != data.shape:
     st.sidebar.caption(
-        f"Displaying downsampled to {display_data.shape[1]}×{display_data.shape[0]} px "
-        "(full-res data is used for elevation calculations)."
+        f"Displaying downsampled to {display_data.shape[1]}×{display_data.shape[0]} px."
     )
 
 LIGHT_SOURCE = LightSource(azdeg=315, altdeg=45)
@@ -708,8 +801,61 @@ def _compute_hillshade_geometry(display_data: np.ndarray):
     # Matches the shape matplotlib's shade_rgb() uses internally for blending.
     intensity = LIGHT_SOURCE.hillshade(smoothed_dem, vert_exag=HILLSHADE_VERT_EXAG)[
         ..., np.newaxis
-    ]
+    ].astype(np.float32)
     return smoothed_dem, intensity
+
+
+NODATA_RGB = np.array([0.80, 0.80, 0.80], dtype=np.float32)  # light grey
+HOVER_GRID_DIM = 500  # resolution of the invisible elevation-readout layer
+JPEG_QUALITY = 90
+
+
+@lru_cache(maxsize=None)
+def _colormap_lut(cmap_name: str) -> np.ndarray:
+    """256-entry RGB lookup table for a colormap (float32, 0-1)."""
+    return plt.get_cmap(cmap_name)(np.linspace(0, 1, 256))[:, :3].astype(np.float32)
+
+
+def _apply_colormap(values: np.ndarray, cmap_name: str, lo: float, hi: float) -> np.ndarray:
+    """Map elevations to RGB via a 256-color lookup table.
+
+    Same result as cmap(Normalize(lo, hi)(values)) at 8-bit precision, but
+    several times faster because it's one uint8 index + gather in float32
+    instead of matplotlib's general float64 path.
+    """
+    scale = 255.0 / max(hi - lo, 1e-6)
+    idx = np.clip((values - lo) * scale, 0, 255)
+    idx = np.nan_to_num(idx, nan=0).astype(np.uint8)
+    rgb = _colormap_lut(cmap_name)[idx]
+    nodata = ~np.isfinite(values)
+    if nodata.any():
+        rgb[nodata] = NODATA_RGB
+    return rgb
+
+
+def _encode_image_source(rgb_uint8: np.ndarray) -> str:
+    """Encode an RGB array as a JPEG data URI for go.Image(source=...).
+
+    Passing the raw pixel array (go.Image(z=...)) sent ~9 MB to the browser on
+    every rerun for a full-size view, and made Plotly rebuild the image pixel
+    by pixel in JavaScript. A JPEG is ~1 MB and the browser draws it natively.
+    """
+    buf = io.BytesIO()
+    Image.fromarray(rgb_uint8).save(buf, format="JPEG", quality=JPEG_QUALITY)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _hover_grid(display_data: np.ndarray, bbox):
+    """Coarse copy of the DEM for an invisible heatmap that provides the
+    elevation hover readout and colorbar without shipping every pixel."""
+    west, south, east, north = bbox
+    step = max(1, -(-max(display_data.shape) // HOVER_GRID_DIM))
+    z = display_data[step // 2 :: step, step // 2 :: step]
+    rows, cols = display_data.shape
+    dx, dy = (east - west) / cols, (north - south) / rows
+    x = west + (np.arange(step // 2, cols, step) + 0.5) * dx
+    y = north - (np.arange(step // 2, rows, step) + 0.5) * dy
+    return z, x, y
 
 
 if hillshade_on:
@@ -722,47 +868,63 @@ if hillshade_on:
         label="hillshade geometry (smooth+shade, cache miss)",
     )
 
-    # Only depends on vmin/vmax/colormap — skipped when a rerun is triggered
-    # by something unrelated (e.g. a boundary checkbox).
-    def _compute_hillshade_color():
-        cmap = plt.get_cmap(colorscale)
-        norm = Normalize(vmin=vmin, vmax=vmax)
-        rgba = cmap(norm(smoothed_dem))
-        rgb = LIGHT_SOURCE.blend_soft_light(rgba[..., :3], intensity)
-        return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
-    rgb_img = _session_cache(
-        "hillshade_color_cache",
-        (st.session_state.get("bbox_key"), vmin, vmax, colorscale),
-        _compute_hillshade_color,
-        label="hillshade color mapping (cache miss)",
-    )
+def _compute_image_source():
+    """Color the terrain (plus hillshade if on) and encode it as a JPEG.
+    Only depends on the data, vmin/vmax, colormap and hillshade toggle —
+    skipped when a rerun is triggered by something unrelated."""
+    if hillshade_on:
+        rgb = _apply_colormap(smoothed_dem, colorscale, vmin, vmax)
+        # Soft-light blend, same formula as matplotlib's
+        # LightSource.blend_soft_light, done in float32.
+        rgb = 2 * intensity * rgb + (1 - 2 * intensity) * rgb**2
+    else:
+        rgb = _apply_colormap(display_data, colorscale, vmin, vmax)
+    rgb_uint8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+    return _encode_image_source(rgb_uint8)
 
+
+image_source = _session_cache(
+    "image_source_cache",
+    (st.session_state.get("bbox_key"), vmin, vmax, colorscale, hillshade_on),
+    _compute_image_source,
+    label="terrain image color+encode (cache miss)",
+)
+hover_z, hover_x, hover_y = _session_cache(
+    "hover_grid_cache",
+    st.session_state.get("bbox_key"),
+    lambda: _hover_grid(display_data, (west, south, east, north)),
+)
+
+with _timed("figure build"):
+    rows, cols = display_data.shape
     fig = go.Figure(
         go.Image(
-            z=rgb_img,
+            source=image_source,
             x0=west,
-            dx=(east - west) / rgb_img.shape[1],
+            dx=(east - west) / cols,
             y0=north,
-            dy=-(north - south) / rgb_img.shape[0],
+            dy=-(north - south) / rows,
+            hoverinfo="skip",
         )
     )
     fig.update_layout(yaxis=dict(autorange=True))
-else:
-    with _timed("heatmap build"):
-        heatmap_colorscale = matplotlib_to_plotly_colorscale(colorscale)
-        fig = go.Figure(
-            go.Heatmap(
-                z=display_data,
-                x=np.linspace(west, east, display_data.shape[1]),
-                y=np.linspace(north, south, display_data.shape[0]),
-                colorscale=heatmap_colorscale,
-                zmin=vmin,
-                zmax=vmax,
-                colorbar=dict(title="m"),
-                hoverongaps=False,
-            )
+    # Invisible, coarse elevation layer on top: gives the hover readout and
+    # the colorbar (now in hillshade mode too) for a tiny payload.
+    fig.add_trace(
+        go.Heatmap(
+            z=hover_z,
+            x=hover_x,
+            y=hover_y,
+            colorscale=matplotlib_to_plotly_colorscale(colorscale),
+            zmin=vmin,
+            zmax=vmax,
+            opacity=0,
+            colorbar=dict(title="m"),
+            hoverongaps=False,
+            hovertemplate="%{y:.3f}°, %{x:.3f}°<br>%{z:,.0f} m<extra></extra>",
         )
+    )
 
 with _timed("state boundaries"):
     if state_lines_on:
@@ -846,7 +1008,7 @@ st.caption(
 # --------------------------------------------------------------------------
 # Profiling readout — remove once you're done diagnosing.
 # --------------------------------------------------------------------------
-with st.sidebar.expander("⏱️ Timings (this rerun)", expanded=True):
+with st.sidebar.expander("⏱️ Timings (this rerun)", expanded=False):
     total_ms = sum(ms for _, ms in st.session_state["_timings"])
     for label, ms in st.session_state["_timings"]:
         st.write(f"{label}: **{ms:.1f} ms**")
