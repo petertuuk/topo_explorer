@@ -897,18 +897,26 @@ hover_z, hover_x, hover_y = _session_cache(
 )
 
 with _timed("figure build"):
-    rows, cols = display_data.shape
-    fig = go.Figure(
-        go.Image(
-            source=image_source,
-            x0=west,
-            dx=(east - west) / cols,
-            y0=north,
-            dy=-(north - south) / rows,
-            hoverinfo="skip",
-        )
+    fig = go.Figure()
+    # The terrain is a layout image pinned by its top-left corner to
+    # (west, north) and stretched to the data extent. Unlike go.Image, whose
+    # row order depends on dy's sign and the axis direction (and differs
+    # between z= and source=), this can't come out flipped.
+    fig.add_layout_image(
+        source=image_source,
+        xref="x",
+        yref="y",
+        x=west,
+        y=north,
+        sizex=east - west,
+        sizey=north - south,
+        xanchor="left",
+        yanchor="top",
+        sizing="stretch",
+        layer="below",
     )
-    fig.update_layout(yaxis=dict(autorange=True))
+    fig.update_xaxes(range=[west, east], showgrid=False, zeroline=False)
+    fig.update_yaxes(range=[south, north], showgrid=False, zeroline=False)
     # Invisible, coarse elevation layer on top: gives the hover readout and
     # the colorbar (now in hillshade mode too) for a tiny payload.
     fig.add_trace(
