@@ -91,6 +91,10 @@ COLORSCALES = {
     "Greys": "gray",
 }
 
+# In land-only mode, colormaps whose low end is blue would make low-lying
+# land look like water, so start them at their first "land" color instead.
+LAND_CMAP_START = {"gist_earth": 0.3}
+
 MAX_DISPLAY_DIM = 2400
 
 STATE_BOUNDARIES_URL = (
@@ -419,7 +423,9 @@ def _add_highways(fig, bbox):
 
 
 @lru_cache(maxsize=None)
-def matplotlib_to_plotly_colorscale(cmap_name: str, n_samples: int = 256) -> tuple:
+def matplotlib_to_plotly_colorscale(
+    cmap_name: str, n_samples: int = 256, start: float = 0.0
+) -> tuple:
     """Converts a Matplotlib colormap into a Plotly-compatible colorscale.
 
     Pure function of its arguments (there are only a handful of colormap
@@ -432,7 +438,7 @@ def matplotlib_to_plotly_colorscale(cmap_name: str, n_samples: int = 256) -> tup
 
     for i in range(n_samples):
         val = i / (n_samples - 1)
-        r, g, b, _ = [int(255 * c) for c in cmap(val)]
+        r, g, b, _ = [int(255 * c) for c in cmap(start + (1 - start) * val)]
         colorscale.append((val, f"rgb({r},{g},{b})"))
 
     return tuple(colorscale)
@@ -601,6 +607,15 @@ else:
 
 st.sidebar.header("Display")
 hillshade_on = st.sidebar.checkbox("Hillshade", value=True)
+land_only = st.sidebar.checkbox(
+    "Flat-color oceans (land-only colors)",
+    value=True,
+    help=(
+        "Draws everything below sea level as flat water and spends the whole "
+        "color range on land, instead of half of it on ocean depth. Note: "
+        "dry land below sea level (e.g. Death Valley) is drawn as water too."
+    ),
+)
 state_lines_on = st.sidebar.checkbox("State boundaries", value=True)
 county_lines_on = st.sidebar.checkbox("County boundaries", value=False)
 lake_lines_on = st.sidebar.checkbox("Lakes & inland water", value=False)
@@ -665,11 +680,17 @@ if need_load:
     has_data = np.isfinite(data).any()
     st.session_state["elev_min"] = float(np.nanmin(data)) if has_data else 0.0
     st.session_state["elev_max"] = float(np.nanmax(data)) if has_data else 1.0
+    # Lowest elevation at or above sea level, for the land-only color range.
+    land = data[data >= 0]
+    st.session_state["land_min"] = float(land.min()) if land.size else None
 
 data = st.session_state["data"]
 extent = st.session_state["extent"]
-elev_min = st.session_state["elev_min"]
 elev_max = st.session_state["elev_max"]
+_land_min = st.session_state.get("land_min")
+# Land-only only makes sense if the view actually contains land.
+land_only = land_only and _land_min is not None
+elev_min = _land_min if land_only else st.session_state["elev_min"]
 
 # --------------------------------------------------------------------------
 # Elevation range slider
@@ -696,17 +717,46 @@ st.sidebar.caption(
 # --------------------------------------------------------------------------
 
 
+CONTOUR_TARGET_LEVELS = 30
+
+
+def _nice_contour_interval(elev_range: float, target_levels: int = CONTOUR_TARGET_LEVELS) -> int:
+    """Round elev_range / target_levels up to a 1-2-5 x 10^n step (min 10 m),
+    so a mountain range gets ~20-40 contours whether you're looking at one
+    valley or the whole country."""
+    raw = max(elev_range, 1.0) / target_levels
+    magnitude = 10 ** np.floor(np.log10(raw))
+    for multiple in (1, 2, 5, 10):
+        if multiple * magnitude >= raw:
+            return int(max(10, multiple * magnitude))
+    return 10
+
+
 contour_on = st.sidebar.checkbox("Contour lines", value=False)
-contour_interval = st.sidebar.slider(
-    "Contour interval (meters)",
-    min_value=10,
-    max_value=500,
-    value=100,
-    step=10,
-)
+contour_interval = None
+if contour_on:
+    auto_interval = _nice_contour_interval(elev_max - elev_min)
+    contour_auto = st.sidebar.checkbox(
+        "Automatic contour interval",
+        value=True,
+        help=f"Picks a round interval giving roughly {CONTOUR_TARGET_LEVELS} "
+        "contour levels across the area's elevation range.",
+    )
+    if contour_auto:
+        contour_interval = auto_interval
+        n_levels = int((elev_max - elev_min) // auto_interval) + 1
+        st.sidebar.caption(f"Contour interval: {auto_interval:,} m (~{n_levels} levels)")
+    else:
+        contour_interval = st.sidebar.slider(
+            "Contour interval (meters)",
+            min_value=10,
+            max_value=1000,
+            value=min(auto_interval, 1000),
+            step=10,
+        )
 
 
-def _compute_contour_trace(display_data, bbox, interval=100):
+def _compute_contour_trace(display_data, bbox, interval=100, min_level=None):
     """Pure computation of contour line vertices — no fig, no Streamlit —
     so it can be cached and reused across reruns that don't change the
     DEM, extent, or interval (e.g. toggling an unrelated checkbox)."""
@@ -718,6 +768,8 @@ def _compute_contour_trace(display_data, bbox, interval=100):
         return _EMPTY_XY
 
     min_elev = np.floor(valid_data.min() / interval) * interval
+    if min_level is not None:
+        min_elev = max(min_elev, min_level)
     max_elev = np.ceil(valid_data.max() / interval) * interval
     levels = np.arange(min_elev, max_elev + interval, interval)
 
@@ -772,6 +824,7 @@ def _add_contour_lines(fig, all_x, all_y):
 # --------------------------------------------------------------------------
 west, east, south, north = extent
 colorscale = COLORSCALES[colormap_choice]
+cmap_start = LAND_CMAP_START.get(colorscale, 0.0) if land_only else 0.0
 
 display_data = _session_cache(
     "display_data_cache",
@@ -806,17 +859,22 @@ def _compute_hillshade_geometry(display_data: np.ndarray):
 
 
 NODATA_RGB = np.array([0.80, 0.80, 0.80], dtype=np.float32)  # light grey
+WATER_RGB = np.array([0.66, 0.80, 0.90], dtype=np.float32)  # flat pale blue
 HOVER_GRID_DIM = 500  # resolution of the invisible elevation-readout layer
 JPEG_QUALITY = 90
 
 
 @lru_cache(maxsize=None)
-def _colormap_lut(cmap_name: str) -> np.ndarray:
-    """256-entry RGB lookup table for a colormap (float32, 0-1)."""
-    return plt.get_cmap(cmap_name)(np.linspace(0, 1, 256))[:, :3].astype(np.float32)
+def _colormap_lut(cmap_name: str, start: float = 0.0) -> np.ndarray:
+    """256-entry RGB lookup table for a colormap (float32, 0-1), optionally
+    using only the part of the colormap from `start` up."""
+    samples = np.linspace(start, 1, 256)
+    return plt.get_cmap(cmap_name)(samples)[:, :3].astype(np.float32)
 
 
-def _apply_colormap(values: np.ndarray, cmap_name: str, lo: float, hi: float) -> np.ndarray:
+def _apply_colormap(
+    values: np.ndarray, cmap_name: str, lo: float, hi: float, start: float = 0.0
+) -> np.ndarray:
     """Map elevations to RGB via a 256-color lookup table.
 
     Same result as cmap(Normalize(lo, hi)(values)) at 8-bit precision, but
@@ -826,7 +884,7 @@ def _apply_colormap(values: np.ndarray, cmap_name: str, lo: float, hi: float) ->
     scale = 255.0 / max(hi - lo, 1e-6)
     idx = np.clip((values - lo) * scale, 0, 255)
     idx = np.nan_to_num(idx, nan=0).astype(np.uint8)
-    rgb = _colormap_lut(cmap_name)[idx]
+    rgb = _colormap_lut(cmap_name, start)[idx]
     nodata = ~np.isfinite(values)
     if nodata.any():
         rgb[nodata] = NODATA_RGB
@@ -871,22 +929,24 @@ if hillshade_on:
 
 def _compute_image_source():
     """Color the terrain (plus hillshade if on) and encode it as a JPEG.
-    Only depends on the data, vmin/vmax, colormap and hillshade toggle —
+    Only depends on the data, vmin/vmax, colormap, hillshade and land-only —
     skipped when a rerun is triggered by something unrelated."""
     if hillshade_on:
-        rgb = _apply_colormap(smoothed_dem, colorscale, vmin, vmax)
+        rgb = _apply_colormap(smoothed_dem, colorscale, vmin, vmax, cmap_start)
         # Soft-light blend, same formula as matplotlib's
         # LightSource.blend_soft_light, done in float32.
         rgb = 2 * intensity * rgb + (1 - 2 * intensity) * rgb**2
     else:
-        rgb = _apply_colormap(display_data, colorscale, vmin, vmax)
+        rgb = _apply_colormap(display_data, colorscale, vmin, vmax, cmap_start)
+    if land_only:
+        rgb[display_data < 0] = WATER_RGB  # NaN compares False: stays nodata grey
     rgb_uint8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
     return _encode_image_source(rgb_uint8)
 
 
 image_source = _session_cache(
     "image_source_cache",
-    (st.session_state.get("bbox_key"), vmin, vmax, colorscale, hillshade_on),
+    (st.session_state.get("bbox_key"), vmin, vmax, colorscale, hillshade_on, land_only),
     _compute_image_source,
     label="terrain image color+encode (cache miss)",
 )
@@ -924,7 +984,7 @@ with _timed("figure build"):
             z=hover_z,
             x=hover_x,
             y=hover_y,
-            colorscale=matplotlib_to_plotly_colorscale(colorscale),
+            colorscale=matplotlib_to_plotly_colorscale(colorscale, start=cmap_start),
             zmin=vmin,
             zmax=vmax,
             opacity=0,
@@ -974,11 +1034,12 @@ with _timed("contour lines"):
         try:
             all_x, all_y = _session_cache(
                 "contour_trace_cache",
-                (st.session_state.get("bbox_key"), contour_interval),
+                (st.session_state.get("bbox_key"), contour_interval, land_only),
                 lambda: _compute_contour_trace(
                     display_data,
                     (west, south, east, north),
                     interval=contour_interval,
+                    min_level=0.0 if land_only else None,
                 ),
                 label="contour lines (cache miss)",
             )
